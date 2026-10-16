@@ -4,7 +4,7 @@
 실행:  streamlit run app.py
 
 구성
-  - 데이터 계층 : load_data() / save_data()  ← 구글 시트·DB로 바꿀 때 이 두 함수만 교체
+  - 데이터 계층 : load_data() / save_data()  ← Secrets에 GSCRIPT_URL이 있으면 구글 시트, 없으면 CSV 자동 사용
   - Tab 1      : 📋 동문 수첩 보기 (통계, 검색·필터·정렬, 카드/표 보기)
   - Tab 2      : ✏️ 내 정보 등록/수정 (이름+학번 기준 Upsert, 기존 정보 불러오기)
   - Tab 3      : ⚙️ 정보 삭제 / 관리 (본인 삭제, 방장 전체 명단 다운로드)
@@ -66,23 +66,76 @@ st.markdown(
 # ─────────────────────────────────────────────────────────────
 # 1. 데이터 계층 (저장소를 바꿀 때는 이 두 함수만 수정)
 # ─────────────────────────────────────────────────────────────
+# 저장소 자동 선택
+#   - Secrets 에 GSCRIPT_URL 이 있으면 → 구글 시트 (Apps Script 경유, Streamlit Cloud 배포용)
+#   - 없으면                          → 로컬 alumni_data.csv (내 컴퓨터 테스트용)
+#     ※ Streamlit Cloud 에서 CSV 모드로 돌면 앱이 잠들 때 데이터가 지워지므로 화면에 경고를 띄운다.
+GSCRIPT_URL = _secret("GSCRIPT_URL", "")
+GSCRIPT_TOKEN = _secret("GSCRIPT_TOKEN", "")
+USE_GSHEETS = bool(GSCRIPT_URL)
+
+
+def _clean(df: pd.DataFrame) -> pd.DataFrame:
+    """어느 저장소에서 읽었든 COLUMNS 순서의 문자열 DataFrame 으로 정리한다."""
+    df = df.dropna(how="all")                       # 완전히 빈 행 제거
+    for col in COLUMNS:                             # 컬럼이 빠진 경우도 안전하게 처리
+        if col not in df.columns:
+            df[col] = ""
+    df = df[COLUMNS].fillna("").astype(str)
+    # 시트가 학번을 숫자로 바꿔 둔 경우 보정: 5 / 5.0 → "05"
+    df["학번"] = df["학번"].str.replace(r"\.0$", "", regex=True)
+    df.loc[df["학번"].str.fullmatch(r"\d"), "학번"] = df["학번"].str.zfill(2)
+    df = df[df["이름"].str.strip() != ""]           # 이름이 빈 행은 무시
+    return df.reset_index(drop=True)
+
+
+def _gscript_call(method: str, payload: dict | None = None) -> dict:
+    """구글 Apps Script 웹앱 호출. 실패하면 화면에 오류를 띄우고 앱을 멈춘다(조용히 넘어가지 않음)."""
+    import requests
+
+    try:
+        if method == "GET":
+            r = requests.get(GSCRIPT_URL, params={"token": GSCRIPT_TOKEN}, timeout=30)
+        else:
+            body = {"token": GSCRIPT_TOKEN, **(payload or {})}
+            r = requests.post(GSCRIPT_URL, json=body, timeout=30)
+        r.raise_for_status()
+        res = r.json()
+    except Exception as e:
+        st.error(
+            "구글 시트에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.  \n"
+            "(방장 확인용: Apps Script 배포 URL·접근 권한 '모든 사용자'·토큰을 확인하세요)  \n"
+            f"`{type(e).__name__}`"
+        )
+        st.stop()
+    if not res.get("ok"):
+        st.error(f"구글 시트 오류: {res.get('error', '알 수 없음')} (방장 확인용: 토큰이 Secrets와 같은지 확인)")
+        st.stop()
+    return res
+
+
 def load_data() -> pd.DataFrame:
     """동문 데이터를 읽어 COLUMNS 순서의 DataFrame(모든 값 문자열)으로 반환한다."""
+    if USE_GSHEETS:
+        rows = _gscript_call("GET").get("rows", [])
+        return _clean(pd.DataFrame(rows, columns=COLUMNS) if rows else pd.DataFrame(columns=COLUMNS))
+
     try:
         # dtype=str : 학번 "05" 가 숫자 5 로 바뀌는 것 방지
         # keep_default_na=False : 빈 칸을 NaN 이 아닌 "" 로 읽음
         df = pd.read_csv(DATA_FILE, dtype=str, encoding="utf-8-sig", keep_default_na=False)
     except FileNotFoundError:
         return pd.DataFrame(columns=COLUMNS)
-
-    for col in COLUMNS:                 # 컬럼이 빠진 파일도 안전하게 처리
-        if col not in df.columns:
-            df[col] = ""
-    return df[COLUMNS].reset_index(drop=True)
+    return _clean(df)
 
 
 def save_data(df: pd.DataFrame) -> None:
-    """DataFrame 전체를 저장한다. 임시 파일에 쓴 뒤 교체해 저장 중 파일이 깨지는 것을 막는다."""
+    """DataFrame 전체를 저장한다."""
+    if USE_GSHEETS:
+        _gscript_call("POST", {"rows": df[COLUMNS].astype(str).values.tolist()})
+        return
+
+    # 로컬 CSV: 임시 파일에 쓴 뒤 교체해 저장 중 파일이 깨지는 것을 막는다.
     import os
 
     tmp = DATA_FILE + ".tmp"
@@ -141,6 +194,10 @@ def today() -> str:
 # ─────────────────────────────────────────────────────────────
 st.title("🎓 건설환경공학과 동문 수첩")
 st.caption("가천대학교 건설환경공학과 동문 연락망 · 본인 정보만 등록·수정해 주세요")
+
+# 구글 시트에 연결되지 않은 상태(임시 저장 모드)면 경고 — 클라우드에서는 데이터가 사라질 수 있음
+if not USE_GSHEETS:
+    st.warning("⚠️ 임시 저장 모드: 구글 시트에 연결되지 않아 데이터가 사라질 수 있습니다. (방장: Secrets에 GSCRIPT_URL 설정 필요)")
 
 # st.rerun() 후에는 직전 메시지가 사라지므로, session_state 에 담아 두었다가 여기서 보여준다.
 flash = st.session_state.pop("flash", None)
@@ -404,7 +461,7 @@ with tab_admin:
             all_df = load_data()
             export = all_df.drop(columns=["비밀번호"])      # 다운로드 파일에 PIN 해시는 넣지 않음
             stamp = datetime.now(KST).strftime("%Y%m%d")
-            st.success(f"방장 인증 완료 · 전체 {len(export)}명")
+            st.success(f"방장 인증 완료 · 전체 {len(export)}명 · 저장소: {'구글 시트' if USE_GSHEETS else '임시 CSV'}")
 
             # CSV (엑셀에서 한글이 깨지지 않도록 UTF-8-SIG)
             st.download_button(
